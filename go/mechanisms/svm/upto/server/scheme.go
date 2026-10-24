@@ -7,7 +7,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"regexp"
 	"strconv"
 	"strings"
 
@@ -25,13 +24,11 @@ import (
 // SVM `upto`: funds move through an onchain payment channel.
 const AssetTransferMethodChannel = "channel"
 
-// priceSuffixPattern matches a trailing asset symbol in a price string.
-var priceSuffixPattern = regexp.MustCompile(`[A-Za-z][A-Za-z0-9]*\s*$`)
-
 // Config configures the server-side SVM `upto` scheme.
 type Config struct {
 	// ReceiverAuthorizerSigner is the server hot key set as the channel
-	// authorized_signer. It signs settlement vouchers and is required.
+	// authorized_signer. It signs settlement vouchers. Omit to delegate to
+	// the facilitator's advertised receiverAuthorizer.
 	ReceiverAuthorizerSigner svm.ReceiverAuthorizerSigner
 
 	// WithdrawDelay is the channel grace period in seconds. Defaults to
@@ -47,19 +44,19 @@ type Config struct {
 // payments.
 //
 // It declares the escrow payment flow: a deposit settle before the handler and
-// a claim (or zero-amount cancel) settle after. The voucher for the metered
-// amount is attached only on the claim/cancel settle; the deposit settle must
-// not carry one.
+// a claim (or zero-amount cancel) settle after. enrichSettlementPayload stamps
+// type on every settle and attaches the receiver-authorizer voucher on
+// claim/cancel only when the server owns the key.
 type UptoSvmScheme struct {
 	moneyParsers []x402.MoneyParser
 	config       *Config
 }
 
-// NewUptoSvmScheme creates a new UptoSvmScheme. The receiver authorizer signer
-// is required: without it the server cannot authorize any settlement.
+// NewUptoSvmScheme creates a new UptoSvmScheme. Omit ReceiverAuthorizerSigner
+// to delegate voucher signing to the facilitator.
 func NewUptoSvmScheme(config *Config) *UptoSvmScheme {
-	if config == nil || config.ReceiverAuthorizerSigner == nil {
-		panic("upto svm server: ReceiverAuthorizerSigner is required")
+	if config == nil {
+		config = &Config{}
 	}
 	return &UptoSvmScheme{
 		moneyParsers: []x402.MoneyParser{},
@@ -104,7 +101,8 @@ func (s *UptoSvmScheme) GetAssetDecimals(_ string, _ x402.Network) int {
 }
 
 // ValidateFacilitatorSupport fails server startup when the facilitator does not
-// advertise a usable feePayer: without one, no client can build an open.
+// advertise a usable feePayer: without one, no client can build an open. When
+// this server delegates, the facilitator must also advertise a receiverAuthorizer.
 func (s *UptoSvmScheme) ValidateFacilitatorSupport(
 	network x402.Network,
 	supportedKind types.SupportedKind,
@@ -117,7 +115,20 @@ func (s *UptoSvmScheme) ValidateFacilitatorSupport(
 			network,
 		)
 	}
-	return nil
+	if s.config.ReceiverAuthorizerSigner != nil {
+		return nil
+	}
+
+	advertised, _ := supportedKind.Extra[upto.ExtraReceiverAuthorizer].(string)
+	if svm.ValidateSolanaAddress(advertised) {
+		return nil
+	}
+	return fmt.Errorf(
+		"no receiverAuthorizerSigner is configured and the facilitator does not advertise a "+
+			"receiverAuthorizer on %s. Configure a receiverAuthorizerSigner or use a "+
+			"facilitator that advertises one",
+		network,
+	)
 }
 
 // SettleOnCancel settles canceled verified payments as a zero-amount refund so
@@ -137,17 +148,19 @@ func (s *UptoSvmScheme) SettleOnCancel(ctx x402.VerifiedPaymentCanceledContext) 
 	return &requirements, nil
 }
 
-// EnrichSettlementPayload attaches the receiver-authorizer voucher on the
-// claim and cancel settles. The deposit settle (before-handler) must not carry
-// a voucher: the facilitator rejects one there because no usage has occurred.
+// EnrichSettlementPayload stamps type on every settle. It attaches the
+// receiver-authorizer voucher on claim/cancel only when this server owns the key.
 func (s *UptoSvmScheme) EnrichSettlementPayload(ctx x402.SettleContext) (map[string]interface{}, error) {
 	if ctx.Phase == x402.SettlePhaseBeforeHandler {
-		return nil, nil
+		return map[string]interface{}{svm.UptoPayloadTypeField: svm.UptoPayloadTypeDeposit}, nil
 	}
 
-	// A payload from another mechanism has no voucher to sign.
+	claimFields := map[string]interface{}{svm.UptoPayloadTypeField: svm.UptoPayloadTypeClaim}
 	if !svm.IsUptoSvmPayload(ctx.Payload.GetPayload()) {
-		return nil, nil
+		return claimFields, nil
+	}
+	if s.config.ReceiverAuthorizerSigner == nil {
+		return claimFields, nil
 	}
 	payload, err := svm.UptoPayloadFromMap(ctx.Payload.GetPayload())
 	if err != nil {
@@ -181,13 +194,14 @@ func (s *UptoSvmScheme) EnrichSettlementPayload(ctx x402.SettleContext) (map[str
 	}
 
 	return map[string]interface{}{
+		svm.UptoPayloadTypeField:      svm.UptoPayloadTypeClaim,
 		svm.UptoVoucherSignatureField: solana.SignatureFromBytes(signature).String(),
 	}, nil
 }
 
 // RegisterMoneyParser registers a custom money parser in the parser chain.
 // Multiple parsers can be registered - they will be tried in registration order.
-// Each parser receives a decimal amount (e.g., 1.50 for $1.50).
+// Each parser receives a decimal string (e.g., "1.50" for $1.50).
 // If a parser returns nil, the next parser in the chain will be tried.
 // The default parser is always the final fallback.
 func (s *UptoSvmScheme) RegisterMoneyParser(parser x402.MoneyParser) *UptoSvmScheme {
@@ -201,7 +215,7 @@ func (s *UptoSvmScheme) RegisterMoneyParser(parser x402.MoneyParser) *UptoSvmSch
 // Falls back to default conversion if all custom parsers return nil.
 func (s *UptoSvmScheme) ParsePrice(price x402.Price, network x402.Network) (x402.AssetAmount, error) {
 	networkStr := string(network)
-	config, err := svm.GetNetworkConfig(networkStr)
+	defaultAsset, err := svm.GetDefaultAsset(networkStr, "")
 	if err != nil {
 		return x402.AssetAmount{}, err
 	}
@@ -213,7 +227,7 @@ func (s *UptoSvmScheme) ParsePrice(price x402.Price, network x402.Network) (x402
 				return x402.AssetAmount{}, errors.New(ErrAmountMustBeString)
 			}
 
-			asset := config.DefaultAsset.Address
+			asset := defaultAsset.Asset
 			if assetStr, ok := priceMap["asset"].(string); ok && assetStr != "" {
 				asset = assetStr
 			}
@@ -227,7 +241,7 @@ func (s *UptoSvmScheme) ParsePrice(price x402.Price, network x402.Network) (x402
 		}
 	}
 
-	decimalAmount, stablecoin, err := s.parseMoney(price)
+	decimalAmount, symbol, err := x402.ParseMoney(price)
 	if err != nil {
 		return x402.AssetAmount{}, err
 	}
@@ -242,12 +256,13 @@ func (s *UptoSvmScheme) ParsePrice(price x402.Price, network x402.Network) (x402
 		}
 	}
 
-	return s.defaultMoneyConversion(decimalAmount, networkStr, stablecoin)
+	return s.defaultMoneyConversion(decimalAmount, networkStr, symbol)
 }
 
 // EnhancePaymentRequirements folds the facilitator's feePayer into the
-// requirement, declares the server-owned receiverAuthorizer and withdrawDelay,
-// and embeds a fresh blockhash/slot pair for the client open when configured.
+// requirement, declares receiverAuthorizer (local signer, else the
+// facilitator's advertised key) and withdrawDelay, and embeds a fresh
+// blockhash/slot pair for the client open when configured.
 func (s *UptoSvmScheme) EnhancePaymentRequirements(
 	ctx context.Context,
 	requirements types.PaymentRequirements,
@@ -255,18 +270,22 @@ func (s *UptoSvmScheme) EnhancePaymentRequirements(
 	extensionKeys []string,
 ) (types.PaymentRequirements, error) {
 	networkStr := string(requirements.Network)
-	config, err := svm.GetNetworkConfig(networkStr)
-	if err != nil {
+	if _, err := svm.NormalizeNetwork(networkStr); err != nil {
 		return requirements, err
 	}
 
-	assetInfo := &config.DefaultAsset
+	var assetInfo *svm.AssetInfo
+	var err error
 	if requirements.Asset != "" {
 		assetInfo, err = svm.GetAssetInfo(networkStr, requirements.Asset)
 		if err != nil {
 			return requirements, err
 		}
 	} else {
+		assetInfo, err = svm.GetAssetInfo(networkStr, "")
+		if err != nil {
+			return requirements, err
+		}
 		requirements.Asset = assetInfo.Address
 	}
 
@@ -293,7 +312,15 @@ func (s *UptoSvmScheme) EnhancePaymentRequirements(
 			withdrawDelay = uint32(requirements.MaxTimeoutSeconds)
 		}
 	}
-	extra[upto.ExtraReceiverAuthorizer] = s.config.ReceiverAuthorizerSigner.Address().String()
+	advertised, _ := supportedKind.Extra[upto.ExtraReceiverAuthorizer].(string)
+	receiverAuthorizer := advertised
+	if s.config.ReceiverAuthorizerSigner != nil {
+		receiverAuthorizer = s.config.ReceiverAuthorizerSigner.Address().String()
+	}
+	if !svm.ValidateSolanaAddress(receiverAuthorizer) {
+		return requirements, errors.New("payment requirements must include a valid extra.receiverAuthorizer")
+	}
+	extra[upto.ExtraReceiverAuthorizer] = receiverAuthorizer
 	extra[upto.ExtraWithdrawDelay] = withdrawDelay
 
 	// Token-2022 mints (USDG, PYUSD, CASH) need their own program on the open, and
@@ -324,7 +351,7 @@ func (s *UptoSvmScheme) enrichBlockhashHints(ctx context.Context, extra map[stri
 		return
 	}
 
-	latest, err := rpc.New(s.config.RPCURL).GetLatestBlockhash(ctx, upto.BlockhashCommitment)
+	latest, err := rpc.New(s.config.RPCURL).GetLatestBlockhash(ctx, paymentchannels.BlockhashCommitment)
 	if err != nil || latest == nil {
 		return
 	}
@@ -334,75 +361,44 @@ func (s *UptoSvmScheme) enrichBlockhashHints(ctx context.Context, extra map[stri
 	extra[upto.ExtraRecentSlot] = strconv.FormatUint(latest.Context.Slot, 10)
 }
 
-// parseMoney converts Money (string | number) to a decimal amount, recognizing a
-// trailing stablecoin symbol ("$1.50", "1.50 PYUSD"). An empty symbol selects the
-// network default.
-func (s *UptoSvmScheme) parseMoney(price x402.Price) (float64, string, error) {
-	switch typed := price.(type) {
-	case string:
-		cleanPrice := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(typed), "$"))
-		parts := strings.Fields(cleanPrice)
-		if len(parts) == 0 {
-			return 0, "", fmt.Errorf(ErrInvalidPriceFormat+": %v", price)
-		}
-		amount, err := strconv.ParseFloat(parts[0], 64)
-		if err != nil {
-			return 0, "", fmt.Errorf(ErrFailedToParsePrice+": '%s': %w", typed, err)
-		}
-		return amount, priceStablecoinSuffix(cleanPrice), nil
-	case float64:
-		return typed, "", nil
-	case int:
-		return float64(typed), "", nil
-	case int64:
-		return float64(typed), "", nil
-	}
-	return 0, "", fmt.Errorf(ErrInvalidPriceFormat+": %v", price)
-}
-
-// priceStablecoinSuffix reads a trailing stablecoin symbol from a price. "USD" is
-// USDC; anything unsupported is ignored so the network default applies.
-func priceStablecoinSuffix(cleanPrice string) string {
-	suffix := strings.ToUpper(priceSuffixPattern.FindString(cleanPrice))
-	if suffix == "USD" {
-		return "USDC"
-	}
-	if _, ok := svm.StablecoinTokenPrograms[suffix]; ok {
-		return suffix
-	}
-	return ""
-}
-
 // defaultMoneyConversion converts a decimal amount to atomic units of the
 // requested stablecoin, defaulting to the network's default asset.
 func (s *UptoSvmScheme) defaultMoneyConversion(
-	amount float64,
+	amount string,
 	network string,
-	stablecoin string,
+	symbol string,
 ) (x402.AssetAmount, error) {
-	asset, err := svm.GetStablecoinAddress(defaultStablecoin(stablecoin), network)
+	assetInfo, err := svm.GetDefaultAsset(network, symbol)
 	if err != nil {
-		return x402.AssetAmount{}, fmt.Errorf(ErrFailedToConvertAmount+": %w", err)
+		if symbol != "" {
+			if address, stablecoinErr := svm.GetStablecoinAddress(strings.ToUpper(symbol), network); stablecoinErr == nil {
+				tokenAmount, convertErr := x402.ConvertToTokenAmount(amount, svm.StablecoinDecimals)
+				if convertErr != nil {
+					return x402.AssetAmount{}, fmt.Errorf(ErrFailedToConvertAmount+": %w", convertErr)
+				}
+				return x402.AssetAmount{
+					Amount: tokenAmount,
+					Asset:  address,
+					Extra:  make(map[string]interface{}),
+				}, nil
+			}
+		}
+		assetInfo, err = svm.GetDefaultAsset(network, "")
+		if err != nil {
+			return x402.AssetAmount{}, fmt.Errorf(ErrFailedToConvertAmount+": %w", err)
+		}
 	}
 
-	amountStr := strconv.FormatFloat(amount, 'f', svm.StablecoinDecimals, 64)
-	parsedAmount, err := svm.ParseAmount(amountStr, svm.StablecoinDecimals)
+	tokenAmount, err := x402.ConvertToTokenAmount(amount, assetInfo.Decimals)
 	if err != nil {
 		return x402.AssetAmount{}, fmt.Errorf(ErrFailedToConvertAmount+": %w", err)
 	}
 
 	return x402.AssetAmount{
-		Amount: strconv.FormatUint(parsedAmount, 10),
-		Asset:  asset,
+		Amount: tokenAmount,
+		Asset:  assetInfo.Asset,
 		Extra:  make(map[string]interface{}),
 	}, nil
-}
-
-func defaultStablecoin(stablecoin string) string {
-	if stablecoin == "" {
-		return "USDC"
-	}
-	return stablecoin
 }
 
 // requirementsFromView rebuilds concrete requirements from the version-agnostic

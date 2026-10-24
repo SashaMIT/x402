@@ -12,13 +12,17 @@ import {
 } from "@x402/core/types";
 import type { DeepReadonly } from "@x402/core/types";
 import type { SettleContext, SettleResultContext } from "@x402/core/server";
-import { convertToTokenAmount, numberToDecimalString, parseMoney } from "@x402/core/utils";
+import { convertToTokenAmount, parseMoney } from "@x402/core/utils";
 import type { FacilitatorClient } from "@x402/core/server";
 import { getAddress } from "viem";
 import { BatchSettlementChannelManager } from "./channelManager";
 import { findDefaultAsset, getDefaultAsset } from "../../defaultAssets";
 import type { AuthorizerSigner, BatchSettlementAssetTransferMethod } from "../types";
-import { BATCH_SETTLEMENT_SCHEME, MIN_WITHDRAW_DELAY } from "../constants";
+import {
+  BATCH_SETTLEMENT_SCHEME,
+  DEFAULT_SERVER_MIN_DEPOSIT_MULTIPLIER,
+  MIN_WITHDRAW_DELAY,
+} from "../constants";
 import { InMemoryChannelStorage, ChannelStorage, type Channel } from "./storage";
 import {
   handleAfterVerify,
@@ -40,6 +44,7 @@ export interface BatchSettlementEvmSchemeServerConfig {
   receiverAuthorizerSigner?: AuthorizerSigner;
   withdrawDelay?: number;
   onchainStateTtlMs?: number;
+  enforceMinDeposit?: boolean;
 }
 
 export interface BatchSettlementRequestContext {
@@ -72,6 +77,7 @@ export class BatchSettlementEvmScheme implements SchemeNetworkServer {
   private readonly receiverAddress: `0x${string}`;
   private readonly withdrawDelay: number;
   private readonly onchainStateTtlMs: number;
+  private readonly enforceMinDeposit: boolean;
 
   /**
    * Constructs a batched server scheme.
@@ -86,6 +92,7 @@ export class BatchSettlementEvmScheme implements SchemeNetworkServer {
     this.withdrawDelay = config?.withdrawDelay ?? MIN_WITHDRAW_DELAY;
     this.onchainStateTtlMs =
       config?.onchainStateTtlMs ?? defaultOnchainStateTtlMs(this.withdrawDelay);
+    this.enforceMinDeposit = config?.enforceMinDeposit ?? false;
     this.schemeHooks = {
       onBeforeVerify: ctx => handleBeforeVerify(this, ctx),
       onAfterVerify: ctx => handleAfterVerify(this, ctx),
@@ -317,6 +324,7 @@ export class BatchSettlementEvmScheme implements SchemeNetworkServer {
         ...paymentRequirements.extra,
         receiverAuthorizer: getAddress(receiverAuthorizer),
         withdrawDelay: this.withdrawDelay,
+        minDeposit: await this.resolveMinDepositHint(paymentRequirements),
       },
     };
   }
@@ -388,6 +396,15 @@ export class BatchSettlementEvmScheme implements SchemeNetworkServer {
   }
 
   /**
+   * Returns whether deposits below the announced `extra.minDeposit` hint are rejected.
+   *
+   * @returns `true` when {@link BatchSettlementEvmSchemeServerConfig.enforceMinDeposit} is enabled.
+   */
+  getEnforceMinDeposit(): boolean {
+    return this.enforceMinDeposit;
+  }
+
+  /**
    * Returns the receiver-authorizer signer, if configured.
    *
    * @returns Receiver-authorizer signer, or `undefined` when not set.
@@ -422,6 +439,69 @@ export class BatchSettlementEvmScheme implements SchemeNetworkServer {
   }
 
   /**
+   * Resolves the `extra.minDeposit` hint written on every 402.
+   *
+   * @param paymentRequirements - Base payment requirements for the current request.
+   * @returns Atomic minimum deposit hint string.
+   */
+  async resolveMinDepositHint(paymentRequirements: PaymentRequirements): Promise<string> {
+    const amount = BigInt(paymentRequirements.amount);
+    const routeOverride = paymentRequirements.extra?.minDeposit;
+
+    let configuredMin: bigint | undefined;
+    if (typeof routeOverride === "string") {
+      if (/^\d+$/.test(routeOverride)) {
+        configuredMin = this.parseAtomicMinDeposit(routeOverride);
+      } else {
+        configuredMin = this.resolveRouteMoneyMinDeposit(routeOverride, paymentRequirements);
+      }
+    }
+
+    if (configuredMin === undefined) {
+      return (amount * BigInt(DEFAULT_SERVER_MIN_DEPOSIT_MULTIPLIER)).toString();
+    }
+
+    return (amount > configuredMin ? amount : configuredMin).toString();
+  }
+
+  /**
+   * Converts a route-level Money `extra.minDeposit` override to atomic units.
+   *
+   * @param money - Money string from route `accepts.extra.minDeposit`.
+   * @param requirement - Payment requirement supplying asset and network.
+   * @returns Positive integer atomic min deposit.
+   */
+  private resolveRouteMoneyMinDeposit(money: string, requirement: PaymentRequirements): bigint {
+    const defaultAsset = findDefaultAsset(requirement.asset, requirement.network);
+    if (!defaultAsset) {
+      throw new Error(
+        `extra.minDeposit money values are only supported for default assets; ` +
+          `use an integer atomic string for ${requirement.asset} on ${requirement.network}.`,
+      );
+    }
+
+    const { amount } = parseMoney(money);
+    return this.parseAtomicMinDeposit(convertToTokenAmount(amount, defaultAsset.decimals));
+  }
+
+  /**
+   * Validates and normalizes an atomic min deposit amount.
+   *
+   * @param amount - Integer atomic amount string.
+   * @returns Parsed positive bigint.
+   */
+  private parseAtomicMinDeposit(amount: string): bigint {
+    if (!/^\d+$/.test(amount)) {
+      throw new Error("minDeposit must resolve to a positive integer");
+    }
+    const value = BigInt(amount);
+    if (value <= 0n) {
+      throw new Error("minDeposit must resolve to a positive integer");
+    }
+    return value;
+  }
+
+  /**
    * Parses a human-readable money string (e.g. `"$1.50"`) into a decimal number.
    *
    * @param money - Money string (may include `$`) or numeric amount.
@@ -435,9 +515,9 @@ export class BatchSettlementEvmScheme implements SchemeNetworkServer {
    * @param symbol - Optional ticker from a suffixed price
    * @returns {@link AssetAmount} with integer token amount, contract address, and metadata.
    */
-  private defaultMoneyConversion(amount: number, network: Network, symbol?: string): AssetAmount {
+  private defaultMoneyConversion(amount: string, network: Network, symbol?: string): AssetAmount {
     const assetInfo = getDefaultAsset(network, symbol);
-    const tokenAmount = convertToTokenAmount(numberToDecimalString(amount), assetInfo.decimals);
+    const tokenAmount = convertToTokenAmount(amount, assetInfo.decimals);
 
     // EIP-3009 tokens always need name/version for their transferWithAuthorization domain.
     // Permit2 tokens only need them if the token supports EIP-2612 (for gasless permit signing).

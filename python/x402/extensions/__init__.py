@@ -51,6 +51,10 @@ from .builder_code import (  # noqa: E402
     BuilderCodeFacilitatorConfig,
     BuilderCodeFacilitatorExtension,
     BuilderCodeResourceServerExtension,
+    BuilderCodeSuffixData,
+    DataSuffixContext,
+    SettlementMetadata,
+    SettlementMetadataValue,
     builder_code_resource_server_extension,
     declare_builder_code_extension,
     encode_builder_code_suffix,
@@ -110,6 +114,7 @@ from .sign_in_with_x import (  # noqa: E402
     SIWxVerifyOptions,
     SIWxVerifyResult,
     SupportedChain,
+    assert_siwx_challenge_bound_to_origin,
     build_siwx_schema,
     create_siwx_client_extension,
     create_siwx_client_hook,
@@ -190,6 +195,10 @@ __all__ = [
     # Builder Code types
     "BuilderCodeExtensionData",
     "BuilderCodeFacilitatorConfig",
+    "BuilderCodeSuffixData",
+    "DataSuffixContext",
+    "SettlementMetadata",
+    "SettlementMetadataValue",
     # Builder Code CBOR encoding
     "encode_builder_code_suffix",
     "parse_builder_code_suffix_from_calldata",
@@ -269,6 +278,7 @@ __all__ = [
     "verify_siwx_signature",
     "build_siwx_schema",
     # Sign-In-With-X client
+    "assert_siwx_challenge_bound_to_origin",
     "create_siwx_message",
     "create_siwx_payload",
     "encode_siwx_header",

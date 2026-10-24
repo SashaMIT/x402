@@ -172,11 +172,8 @@ func ClassifyEIP3009Signature(
 		return classification, nil
 	}
 
-	code, err := signer.GetCode(ctx, authorization.From)
-	if err != nil {
-		return nil, err
-	}
-	if len(code) > 0 {
+	// Reuse the GetCode result VerifyUniversalSignature already fetched.
+	if sigData.CodeDeployed {
 		classification.IsSmartWallet = true
 		return classification, nil
 	}
@@ -193,6 +190,26 @@ func ClassifyEIP3009Signature(
 	}
 
 	return classification, nil
+}
+
+// IsPlainNonCanonicalECDSASignature reports whether signature is a high-s EOA signature.
+func IsPlainNonCanonicalECDSASignature(
+	ctx context.Context,
+	signer evm.FacilitatorEvmSigner,
+	payer string,
+	signature []byte,
+) (bool, error) {
+	// Plain ECDSA signatures are r || s || v (65 bytes); other lengths may be ERC-1271/6492 wrappers.
+	if len(signature) != 65 || evm.IsCanonicalECDSASignature(signature) {
+		return false, nil
+	}
+
+	code, err := signer.GetCode(ctx, payer)
+	if err != nil {
+		return false, err
+	}
+
+	return len(code) == 0, nil
 }
 
 // SimulateEIP3009Transfer runs the transfer via eth_call.

@@ -224,7 +224,7 @@ func customPaymentMiddleware(server *x402http.HTTPServer) gin.HandlerFunc {
 }
 ```
 
-See **[examples/go/servers/custom/](../../examples/go/servers/custom/)** for complete implementation.
+See **[examples/go/servers/custom/](../examples/go/servers/custom/)** for complete implementation.
 
 ## Advanced Features
 
@@ -281,16 +281,16 @@ Use alternative tokens for payments:
 
 ```go
 evmScheme := evm.NewExactEvmScheme().RegisterMoneyParser(
-    func(amount float64, network x402.Network) (*x402.AssetAmount, error) {
-        // Use DAI for large amounts
-        if amount > 100 {
-            return &x402.AssetAmount{
-                Amount: fmt.Sprintf("%.0f", amount*1e18),
-                Asset:  "0x50c5725949A6F0c72E6C4a641F24049A917DB0Cb", // DAI
-                Extra:  map[string]interface{}{"token": "DAI"},
-            }, nil
+    func(amount string, network x402.Network) (*x402.AssetAmount, error) {
+        tokenAmount, err := x402.ConvertToTokenAmount(amount, 18)
+        if err != nil {
+            return nil, err
         }
-        return nil, nil // Use default USDC for small amounts
+        return &x402.AssetAmount{
+            Amount: tokenAmount,
+            Asset:  "0x50c5725949A6F0c72E6C4a641F24049A917DB0Cb", // DAI
+            Extra:  map[string]interface{}{"token": "DAI"},
+        }, nil
     },
 )
 ```
@@ -768,11 +768,11 @@ facilitator := x402http.NewHTTPFacilitatorClient(&x402http.FacilitatorConfig{
 
 ## Examples
 
-Complete examples are available in [`examples/go/servers/`](../../examples/go/servers/):
+Complete examples are available in [`examples/go/servers/`](../examples/go/servers/):
 
-- **[Gin Server](../../examples/go/servers/gin/)** - Basic integration
-- **[Custom Server](../../examples/go/servers/custom/)** - Custom middleware
-- **[Advanced Patterns](../../examples/go/servers/advanced/)** - Dynamic pricing, hooks, extensions
+- **[Gin Server](../examples/go/servers/gin/)** - Basic integration
+- **[Custom Server](../examples/go/servers/custom/)** - Custom middleware
+- **[Advanced Patterns](../examples/go/servers/advanced/)** - Dynamic pricing, hooks, extensions
 
 ## Migration from V1
 
@@ -817,5 +817,5 @@ import ginmw "github.com/x402-foundation/x402/go/v2/http/gin"
 - **[FACILITATOR.md](FACILITATOR.md)** - Building facilitators
 - **[Mechanisms](mechanisms/)** - Payment scheme implementations
 - **[Extensions](extensions/)** - Protocol extensions
-- **[Examples](../../examples/go/servers/)** - Working server examples
+- **[Examples](../examples/go/servers/)** - Working server examples
 

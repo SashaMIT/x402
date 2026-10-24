@@ -1,5 +1,57 @@
 # @x402/paywall Changelog
 
+## 2.28.0
+
+### Patch Changes
+
+- [dd89698](https://github.com/x402-foundation/x402/commit/dd89698): Add Arc mainnet (chain ID 5042) and Arc Testnet (chain ID 5042002) with native USDC as the default stablecoin ([#3590](https://github.com/x402-foundation/x402/pull/3590)) - Thanks [@NotMcAfee](https://github.com/NotMcAfee)!
+  - @x402/core@2.28.0
+
+## 2.27.0
+
+### Minor Changes
+
+- Updated dependencies [5d3a2b2](https://github.com/x402-foundation/x402/commit/5d3a2b2)
+  - @x402/core@2.27.0
+
+## 2.26.0
+
+### Minor Changes
+
+- Updated dependencies [76fe973](https://github.com/x402-foundation/x402/commit/76fe973)
+  - @x402/core@2.26.0
+
+## 2.25.0
+
+### Minor Changes
+
+- Updated dependencies [1bc2ae8](https://github.com/x402-foundation/x402/commit/1bc2ae8)
+- Updated dependencies [299b9bc](https://github.com/x402-foundation/x402/commit/299b9bc)
+- Updated dependencies [bbcb974](https://github.com/x402-foundation/x402/commit/bbcb974)
+  - @x402/core@2.25.0
+
+## 2.24.0
+
+### Patch Changes
+
+- [6557149](https://github.com/x402-foundation/x402/commit/6557149): Add Sei mainnet (chain ID 1329) and Sei Testnet (chain ID 1328) with native USDC as the default stablecoin ([#3227](https://github.com/x402-foundation/x402/pull/3227)) - Thanks [@alexander-sei](https://github.com/alexander-sei)!
+  - @x402/core@2.24.0
+
+## 2.23.0
+
+### Minor Changes
+
+- Updated dependencies [79b6259](https://github.com/x402-foundation/x402/commit/79b6259)
+- Updated dependencies [4f58723](https://github.com/x402-foundation/x402/commit/4f58723)
+- Updated dependencies [ab1a31a](https://github.com/x402-foundation/x402/commit/ab1a31a)
+- Updated dependencies [c2612d3](https://github.com/x402-foundation/x402/commit/c2612d3)
+- Updated dependencies [656437e](https://github.com/x402-foundation/x402/commit/656437e)
+  - @x402/core@2.23.0
+
+### Patch Changes
+
+- [4f58723](https://github.com/x402-foundation/x402/commit/4f58723): Normalize each mechanism's default assets into `DEFAULT_ASSETS` + `getDefaultAsset` / `findDefaultAsset`, and add client `spendControls`: by default only recognized pegged assets are allowed with a `$1` USD cap; opt into other tokens via `allowedAssets` (list with optional integer atomic `maxAmountPerPayment`, or `true` to allow any); pass `spendControls: false` to disable all spend controls. A non-integer per-asset cap is a config error; a non-integer 402 amount on that path is dropped. Keeta, XRPL, and Concordium now ship USD defaults (USDC, RLUSD, USDR). XRPL pins the RLUSD issuer in the client scheme before signing. `$` settlement overrides throw when `getAssetDecimals` is unknown instead of guessing 6 decimals. Notable API moves: `DEFAULT_STABLECOINS` / `USDC_CONFIG` / `DEFAULT_ASSET_BY_NETWORK` → `DEFAULT_ASSETS` (list per network); identifier field `address` / `asaId` → `asset`; TVM `getDefaultAsset` returns an entry (use `.asset`). EVM `getAssetDecimals` is asset-aware; aptos unknown networks throw; EVM/SVM register helpers scope v1 networks to `config.networks`. Paywall uses `spendControls: false` (UI approval); MCP forwards `spendControls`. ([#3124](https://github.com/x402-foundation/x402/pull/3124)) - Thanks [@phdargen](https://github.com/phdargen)!
+
 ## 2.22.0
 
 ### Minor Changes

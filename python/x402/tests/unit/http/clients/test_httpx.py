@@ -330,6 +330,43 @@ class TestX402AsyncTransport:
         assert mock_transport.handle_async_request.call_count == 2
 
     @pytest.mark.asyncio
+    async def test_hook_uses_request_url_when_response_has_no_request(self):
+        """Transport-level 402 responses often lack request; fall back to request.url."""
+        mock_client = MockX402Client()
+        http_client = x402HTTPClient(mock_client)
+        received: list[str] = []
+
+        def capture_url(ctx):
+            received.append(ctx.request_url)
+            return PaymentRequiredHeadersResult(headers={"Authorization": "Bearer x"})
+
+        http_client.on_payment_required(capture_url)
+
+        payment_required = PaymentRequired(
+            x402_version=2,
+            accepts=[make_payment_requirements()],
+        )
+        encoded = encode_payment_required_header(payment_required)
+        response_402 = httpx.Response(
+            402,
+            headers={"PAYMENT-REQUIRED": encoded},
+            content=b"{}",
+        )
+        response_200 = httpx.Response(200, content=b"{}")
+
+        mock_transport = AsyncMock()
+        mock_transport.handle_async_request = AsyncMock(side_effect=[response_402, response_200])
+
+        transport = x402AsyncTransport(http_client, mock_transport)
+        response = await transport.handle_async_request(
+            httpx.Request("GET", "https://example.com/api")
+        )
+
+        assert response is response_200
+        assert received == ["https://example.com/api"]
+        assert len(mock_client.create_calls) == 0
+
+    @pytest.mark.asyncio
     async def test_recovery_calls_create_payment_payload_twice(self):
         """Recovery retry creates a fresh payload after hook signals recovered."""
         mock_client = MockRecoveringClient()
@@ -656,6 +693,37 @@ class TestConsecutivePayments:
 
         assert x402AsyncTransport.RETRY_KEY not in captured_requests[0].extensions
         assert captured_requests[1].extensions.get(x402AsyncTransport.RETRY_KEY) is True
+
+    @pytest.mark.asyncio
+    async def test_should_not_send_cors_response_header_on_retry(self):
+        """Should not put the response-only Access-Control-Expose-Headers on the retry."""
+        mock_client = MockX402ClientWithCounter()
+
+        payment_required = PaymentRequired(
+            x402_version=2,
+            accepts=[make_payment_requirements()],
+        )
+        encoded = encode_payment_required_header(payment_required)
+
+        captured_requests = []
+
+        async def mock_handle_request(request):
+            captured_requests.append(request)
+            is_retry = request.extensions.get(x402AsyncTransport.RETRY_KEY)
+            if is_retry:
+                return _create_mock_response(200, b'{"success": true}')
+            mock_402 = _create_mock_response(402, b"{}")
+            mock_402.headers = {"PAYMENT-REQUIRED": encoded}
+            return mock_402
+
+        mock_transport = AsyncMock()
+        mock_transport.handle_async_request = mock_handle_request
+
+        transport = x402AsyncTransport(mock_client, mock_transport)
+        await transport.handle_async_request(_create_httpx_request())
+
+        assert len(captured_requests) == 2
+        assert "Access-Control-Expose-Headers" not in captured_requests[1].headers
 
     @pytest.mark.asyncio
     async def test_should_not_modify_original_request(self):

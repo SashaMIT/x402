@@ -16,6 +16,15 @@ describe("ExactKeetaServer", () => {
     vi.clearAllMocks();
   });
 
+  describe("paymentFlows", () => {
+    it("declares authorization and upfront with authorization as the default", () => {
+      expect(server.defaultAssetTransferMethod).toBe("default");
+      expect(server.paymentFlows).toEqual({
+        default: { supported: ["authorization", "upfront"], default: "authorization" },
+      });
+    });
+  });
+
   it("has scheme set to exact", () => {
     expect(server.scheme).toBe("exact");
   });
@@ -120,7 +129,7 @@ describe("ExactKeetaServer", () => {
       server.registerMoneyParser(customParser);
 
       const result = await server.parsePrice("5.00", KEETA_TESTNET_CAIP2);
-      expect(customParser).toHaveBeenCalledWith(5, KEETA_TESTNET_CAIP2);
+      expect(customParser).toHaveBeenCalledWith("5.00", KEETA_TESTNET_CAIP2);
       expect(result).toEqual(customResult);
     });
 

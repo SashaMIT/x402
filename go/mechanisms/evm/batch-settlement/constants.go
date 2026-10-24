@@ -24,6 +24,10 @@ const (
 
 	// MaxWithdrawDelay is the maximum withdraw delay in seconds (30 days).
 	MaxWithdrawDelay = 2_592_000
+
+	// DefaultServerMinDepositMultiplier is the default server SDK multiplier for
+	// extra.minDeposit when no floor is configured.
+	DefaultServerMinDepositMultiplier = 10
 )
 
 // ChannelConfigTypeString is the EIP-712 typed-data primary type string used
@@ -309,6 +313,20 @@ var BatchSettlementRefundNonceABI = []byte(`[
 		"inputs": [{"name": "channelId", "type": "bytes32"}],
 		"outputs": [{"name": "", "type": "uint256"}],
 		"stateMutability": "view"
+	}
+]`)
+
+// BatchSettlementRefundedEventABI for decoding Refunded(channelId, sender, amount).
+var BatchSettlementRefundedEventABI = []byte(`[
+	{
+		"type": "event",
+		"name": "Refunded",
+		"inputs": [
+			{"name": "channelId", "type": "bytes32", "indexed": true},
+			{"name": "sender", "type": "address", "indexed": true},
+			{"name": "amount", "type": "uint128", "indexed": false}
+		],
+		"anonymous": false
 	}
 ]`)
 

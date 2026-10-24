@@ -357,6 +357,17 @@ describe("XRPL exact utilities", () => {
 });
 
 describe("ExactXrplScheme server", () => {
+  describe("paymentFlows", () => {
+    it("declares authorization and upfront with authorization as the default", () => {
+      const server = new ExactXrplServerScheme();
+      expect(server.defaultAssetTransferMethod).toBe("sequence");
+      expect(server.paymentFlows).toEqual({
+        sequence: { supported: ["authorization", "upfront"], default: "authorization" },
+        ticketSequence: { supported: ["authorization", "upfront"], default: "authorization" },
+      });
+    });
+  });
+
   it("passes through explicit AssetAmount pricing", async () => {
     const server = new ExactXrplServerScheme();
 
@@ -466,7 +477,7 @@ describe("ExactXrplScheme server", () => {
     const server = new ExactXrplServerScheme();
 
     await expect(server.parsePrice("$0.10", XRPL_TESTNET)).resolves.toEqual({
-      amount: "0.1",
+      amount: "0.10",
       asset: RLUSD_CURRENCY,
       extra: { issuer: RLUSD_TESTNET_ISSUER },
     });
@@ -487,7 +498,7 @@ describe("ExactXrplScheme server", () => {
   });
 
   it("parses Money before custom parser dispatch", async () => {
-    const parser = vi.fn(async (amount: number) => ({
+    const parser = vi.fn(async (amount: string | number) => ({
       amount: String(amount),
       asset: "USD",
       extra: { issuer },
@@ -499,7 +510,7 @@ describe("ExactXrplScheme server", () => {
       asset: "USD",
       extra: { issuer },
     });
-    expect(parser).toHaveBeenCalledWith(0.01, XRPL_TESTNET);
+    expect(parser).toHaveBeenCalledWith("0.01", XRPL_TESTNET);
   });
 
   it("adds fee metadata while preserving caller extras", async () => {

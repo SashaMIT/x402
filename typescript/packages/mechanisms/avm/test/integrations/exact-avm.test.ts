@@ -27,6 +27,7 @@ import {
 import { ExactAvmScheme as ExactAvmServer } from "../../src/exact/server/scheme";
 import { ExactAvmScheme as ExactAvmFacilitator } from "../../src/exact/facilitator/scheme";
 import type { ExactAvmPayloadV2 } from "../../src/types";
+import { convertToTokenAmount } from "@x402/core/utils";
 
 // Load private keys from environment (Base64-encoded 64-byte keys)
 const CLIENT_PRIVATE_KEY = process.env.CLIENT_PRIVATE_KEY;
@@ -44,6 +45,7 @@ if (!CLIENT_PRIVATE_KEY || !FACILITATOR_PRIVATE_KEY || !SERVER_ADDRESS) {
 const clientSigner = toClientAvmSigner(CLIENT_PRIVATE_KEY);
 const facilitatorSigner = toFacilitatorAvmSigner(FACILITATOR_PRIVATE_KEY);
 const FACILITATOR_ADDRESS = facilitatorSigner.getAddresses()[0];
+const ALGORAND_TESTNET_LEGACY_CAIP2 = `algorand:${ALGORAND_TESTNET_GENESIS_HASH}` as Network;
 
 /**
  * AVM Facilitator Client wrapper
@@ -135,14 +137,22 @@ describe("AVM Integration Tests", () => {
       clientAddress = clientSigner.address;
 
       const avmClient = new ExactAvmClient(clientSigner);
-      client = new x402Client().register(ALGORAND_TESTNET_CAIP2, avmClient);
+      client = new x402Client()
+        .register(ALGORAND_TESTNET_CAIP2, avmClient)
+        .register(ALGORAND_TESTNET_LEGACY_CAIP2, avmClient);
 
       const avmFacilitator = new ExactAvmFacilitator(facilitatorSigner);
-      const facilitator = new x402Facilitator().register(ALGORAND_TESTNET_CAIP2, avmFacilitator);
+      const facilitator = new x402Facilitator().register(
+        [ALGORAND_TESTNET_CAIP2, ALGORAND_TESTNET_LEGACY_CAIP2],
+        avmFacilitator,
+      );
 
       const facilitatorClient = new AvmFacilitatorClient(facilitator);
       server = new x402ResourceServer(facilitatorClient);
-      server.register(ALGORAND_TESTNET_CAIP2, new ExactAvmServer());
+      const avmServer = new ExactAvmServer();
+      server
+        .register(ALGORAND_TESTNET_CAIP2, avmServer)
+        .register(ALGORAND_TESTNET_LEGACY_CAIP2, avmServer);
       await server.initialize();
     });
 
@@ -214,8 +224,9 @@ describe("AVM Integration Tests", () => {
       "should verify and settle when paymentRequirements use legacy full-hash network ID",
       { timeout: 30000 },
       async () => {
-        const legacyNetwork = `algorand:${ALGORAND_TESTNET_GENESIS_HASH}` as Network;
-        const accepts = [buildAvmPaymentRequirements(SERVER_ADDRESS, "1000", legacyNetwork)];
+        const accepts = [
+          buildAvmPaymentRequirements(SERVER_ADDRESS, "1000", ALGORAND_TESTNET_LEGACY_CAIP2),
+        ];
         const resource = {
           url: "https://company.co",
           description: "Company Co. resource",
@@ -232,7 +243,7 @@ describe("AVM Integration Tests", () => {
 
         const settleResponse = await server.settlePayment(paymentPayload, accepted!);
         expect(settleResponse.success).toBe(true);
-        expect(settleResponse.network).toBe(legacyNetwork);
+        expect(settleResponse.network).toBe(ALGORAND_TESTNET_LEGACY_CAIP2);
       },
     );
   });
@@ -433,9 +444,9 @@ describe("AVM Integration Tests", () => {
     it("should use registerMoneyParser for custom conversion", async () => {
       // Register custom parser: large amounts use custom token
       avmServer.registerMoneyParser(async (amount, _network) => {
-        if (amount > 100) {
+        if (Number(amount) > 100) {
           return {
-            amount: (amount * 1e6).toString(), // Custom token with 6 decimals
+            amount: convertToTokenAmount(String(amount), 6), // Custom token with 6 decimals
             asset: "99999999",
             extra: { token: "CUSTOM", tier: "large" },
           };
@@ -471,9 +482,9 @@ describe("AVM Integration Tests", () => {
     it("should support multiple MoneyParser in chain", async () => {
       avmServer
         .registerMoneyParser(async amount => {
-          if (amount > 1000) {
+          if (Number(amount) > 1000) {
             return {
-              amount: (amount * 1e6).toString(),
+              amount: convertToTokenAmount(String(amount), 6),
               asset: "88888888",
               extra: { tier: "vip" },
             };
@@ -481,9 +492,9 @@ describe("AVM Integration Tests", () => {
           return null;
         })
         .registerMoneyParser(async amount => {
-          if (amount > 100) {
+          if (Number(amount) > 100) {
             return {
-              amount: (amount * 1e6).toString(),
+              amount: convertToTokenAmount(String(amount), 6),
               asset: "77777777",
               extra: { tier: "premium" },
             };
@@ -529,7 +540,7 @@ describe("AVM Integration Tests", () => {
         // Simulate async API call
         await new Promise(resolve => setTimeout(resolve, 10));
 
-        const usdcAmount = amount * mockExchangeRate;
+        const usdcAmount = Number(amount) * mockExchangeRate;
         return {
           amount: Math.floor(usdcAmount * 1e6).toString(),
           asset: USDC_TESTNET_ASA_ID,
@@ -550,7 +561,7 @@ describe("AVM Integration Tests", () => {
       // 100 USD * 1.02 = 102 USDC
       expect(requirements[0].amount).toBe("102000000");
       expect(requirements[0].extra?.exchangeRate).toBe(1.02);
-      expect(requirements[0].extra?.originalUSD).toBe(100);
+      expect(requirements[0].extra?.originalUSD).toBe("100");
     });
 
     it("should avoid floating-point rounding error", async () => {

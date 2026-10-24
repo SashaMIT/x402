@@ -136,7 +136,9 @@ class x402HTTPAdapter(HTTPAdapter):
 
             payment_required = self._http_client.get_payment_required_response(get_header, body)
 
-            hook_headers = self._http_client.handle_payment_required(payment_required)
+            hook_headers = self._http_client.handle_payment_required(
+                payment_required, response.url or request.url
+            )
             if hook_headers:
                 hook_request = request.copy()
                 hook_request.headers.update(hook_headers)
@@ -153,9 +155,6 @@ class x402HTTPAdapter(HTTPAdapter):
             # Create a copy of the request for retry (don't modify original)
             paid_request = request.copy()
             paid_request.headers.update(payment_headers)
-            paid_request.headers["Access-Control-Expose-Headers"] = (
-                "PAYMENT-RESPONSE,X-PAYMENT-RESPONSE"
-            )
             paid_request.headers[self.RETRY_HEADER] = "1"
 
             # Retry request with payment
@@ -173,9 +172,6 @@ class x402HTTPAdapter(HTTPAdapter):
                 fresh_headers = self._http_client.encode_payment_signature_header(fresh_payload)
                 recovery_request = request.copy()
                 recovery_request.headers.update(fresh_headers)
-                recovery_request.headers["Access-Control-Expose-Headers"] = (
-                    "PAYMENT-RESPONSE,X-PAYMENT-RESPONSE"
-                )
                 recovery_request.headers[self.RECOVERY_HEADER] = "1"
                 recovery_response = super().send(recovery_request, **kwargs)
                 # Fire hooks on retry response — no further recovery

@@ -23,16 +23,19 @@ import type {
 } from "../client/x402Client";
 
 /**
- * Money parser function that converts a numeric amount to an AssetAmount
- * Receives the amount as a decimal number (e.g., 1.50 for $1.50)
- * Returns null to indicate "cannot handle this amount", causing fallback to next parser
+ * Money parser that converts a decimal amount to an AssetAmount.
+ * `parsePrice` always passes the decimal string produced by parseMoney.
+ * Returns null to indicate "cannot handle this amount", causing fallback to next parser.
  * Always returns a Promise for consistency - use async/await
  *
- * @param amount - The decimal amount (e.g., 1.50)
+ * @param amount - Decimal amount as a string (or number, if the parser is called directly)
  * @param network - The network identifier for context
  * @returns AssetAmount or null to try next parser
  */
-export type MoneyParser = (amount: number, network: Network) => Promise<AssetAmount | null>;
+export type MoneyParser = (
+  amount: string | number,
+  network: Network,
+) => Promise<AssetAmount | null>;
 
 /**
  * Result of createPaymentPayload - the core payload fields.
@@ -45,12 +48,12 @@ export type PaymentPayloadResult = Pick<PaymentPayload, "x402Version" | "payload
 };
 
 /**
- * Context passed to scheme's createPaymentPayload for extensions awareness.
- * Contains the server-declared extensions from PaymentRequired so the scheme
- * can check which extensions are advertised and respond accordingly.
+ * Context passed to scheme `createPaymentPayload`.
+ * `maxAmountPerPayment` is the resolved atomic spend cap; omitted when uncapped.
  */
 export interface PaymentPayloadContext {
   extensions?: Record<string, unknown>;
+  maxAmountPerPayment?: string;
 }
 
 export interface SchemeClientHooks {

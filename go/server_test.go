@@ -164,6 +164,97 @@ func TestServerInitialize(t *testing.T) {
 	}
 }
 
+// mockValidatingScheme implements FacilitatorSupportValidator so Initialize
+// capability checks can be unit-tested.
+type mockValidatingScheme struct {
+	mockSchemeNetworkServer
+	problem       string
+	validateCalls int
+}
+
+func (m *mockValidatingScheme) ValidateFacilitatorSupport(_ Network, _ types.SupportedKind, _ []string) error {
+	m.validateCalls++
+	if m.problem == "" {
+		return nil
+	}
+	return errors.New(m.problem)
+}
+
+func TestServerInitializeRejectsCapabilityProblems(t *testing.T) {
+	ctx := context.Background()
+	mockClient := &mockServerFacilitatorClient{
+		kinds: []SupportedKind{
+			{X402Version: 2, Scheme: "exact", Network: "eip155:8453"},
+		},
+	}
+	server := Newx402ResourceServer(
+		WithFacilitatorClient(mockClient),
+		WithSchemeServer("eip155:8453", &mockValidatingScheme{
+			mockSchemeNetworkServer: mockSchemeNetworkServer{scheme: "exact"},
+			problem:                 "needs a signer",
+		}),
+	)
+
+	err := server.Initialize(ctx)
+	if err == nil {
+		t.Fatal("Expected capability error")
+	}
+	if !strings.Contains(err.Error(), "exact on eip155:8453: needs a signer") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	var capErr *FacilitatorCapabilityError
+	if !errors.As(err, &capErr) {
+		t.Fatalf("Expected FacilitatorCapabilityError, got %T: %v", err, err)
+	}
+}
+
+func TestServerInitializeAcceptsValidCapabilityHook(t *testing.T) {
+	ctx := context.Background()
+	mockClient := &mockServerFacilitatorClient{
+		kinds: []SupportedKind{
+			{X402Version: 2, Scheme: "exact", Network: "eip155:8453"},
+		},
+	}
+	scheme := &mockValidatingScheme{
+		mockSchemeNetworkServer: mockSchemeNetworkServer{scheme: "exact"},
+	}
+	server := Newx402ResourceServer(
+		WithFacilitatorClient(mockClient),
+		WithSchemeServer("eip155:8453", scheme),
+	)
+
+	if err := server.Initialize(ctx); err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	if scheme.validateCalls != 1 {
+		t.Fatalf("expected 1 validate call, got %d", scheme.validateCalls)
+	}
+}
+
+func TestServerInitializeSkipsUnsupportedSchemeCapabilityHook(t *testing.T) {
+	ctx := context.Background()
+	mockClient := &mockServerFacilitatorClient{
+		kinds: []SupportedKind{
+			{X402Version: 2, Scheme: "exact", Network: "eip155:8453"},
+		},
+	}
+	scheme := &mockValidatingScheme{
+		mockSchemeNetworkServer: mockSchemeNetworkServer{scheme: "unsupported"},
+		problem:                 "should not be reported",
+	}
+	server := Newx402ResourceServer(
+		WithFacilitatorClient(mockClient),
+		WithSchemeServer("eip155:8453", scheme),
+	)
+
+	if err := server.Initialize(ctx); err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	if scheme.validateCalls != 0 {
+		t.Fatalf("expected 0 validate calls, got %d", scheme.validateCalls)
+	}
+}
+
 func TestServerInitializeWithMultipleFacilitators(t *testing.T) {
 	ctx := context.Background()
 
@@ -1180,6 +1271,7 @@ func TestResolveSettlementOverrideAmount(t *testing.T) {
 	}
 
 	t.Run("raw atomic units", func(t *testing.T) {
+		reqs := types.PaymentRequirements{Amount: "999999"}
 		tests := []struct {
 			input    string
 			expected string
@@ -1189,7 +1281,7 @@ func TestResolveSettlementOverrideAmount(t *testing.T) {
 			{"999999", "999999"},
 		}
 		for _, tt := range tests {
-			result, err := ResolveSettlementOverrideAmount(tt.input, baseReqs, 6)
+			result, err := ResolveSettlementOverrideAmount(tt.input, reqs, 6)
 			if err != nil {
 				t.Errorf("ResolveSettlementOverrideAmount(%q) error: %v", tt.input, err)
 			}
@@ -1206,11 +1298,15 @@ func TestResolveSettlementOverrideAmount(t *testing.T) {
 			expected string
 		}{
 			{"50%", "2000", "1000"},
+			{"12.5%", "2000", "250"},
+			{"12.50%", "2000", "250"},
 			{"100%", "2000", "2000"},
 			{"0%", "2000", "0"},
 			{"25%", "2000", "500"},
 			{"33.33%", "3000", "999"},
 			{"10.5%", "1000", "105"},
+			{"50%", "3", "1"},
+			{"50%", "18446744073709551616", "9223372036854775808"},
 		}
 		for _, tt := range tests {
 			reqs := types.PaymentRequirements{Amount: tt.amount}
@@ -1224,7 +1320,16 @@ func TestResolveSettlementOverrideAmount(t *testing.T) {
 		}
 	})
 
+	t.Run("percent format with invalid requirements amount", func(t *testing.T) {
+		reqs := types.PaymentRequirements{Amount: "not-a-number"}
+		_, err := ResolveSettlementOverrideAmount("50%", reqs, 6)
+		if err == nil {
+			t.Fatal("expected invalid requirements amount error")
+		}
+	})
+
 	t.Run("dollar price with default 6 decimals", func(t *testing.T) {
+		reqs := types.PaymentRequirements{Amount: "10000000"}
 		tests := []struct {
 			input    string
 			expected string
@@ -1233,9 +1338,13 @@ func TestResolveSettlementOverrideAmount(t *testing.T) {
 			{"$0.05", "50000"},
 			{"$0.001", "1000"},
 			{"$0", "0"},
+			{"$1.0000005", "1000000"},
+			{"$0.0000005", "0"},
+			{"$0.0000009", "0"},
+			{"$0.00", "0"},
 		}
 		for _, tt := range tests {
-			result, err := ResolveSettlementOverrideAmount(tt.input, baseReqs, 6)
+			result, err := ResolveSettlementOverrideAmount(tt.input, reqs, 6)
 			if err != nil {
 				t.Errorf("ResolveSettlementOverrideAmount(%q) error: %v", tt.input, err)
 			}
@@ -1246,7 +1355,7 @@ func TestResolveSettlementOverrideAmount(t *testing.T) {
 	})
 
 	t.Run("dollar price with 8 decimals", func(t *testing.T) {
-		reqs := types.PaymentRequirements{Amount: "2000"}
+		reqs := types.PaymentRequirements{Amount: "10000000"}
 		result, err := ResolveSettlementOverrideAmount("$0.05", reqs, 8)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
@@ -1269,7 +1378,7 @@ func TestResolveSettlementOverrideAmount(t *testing.T) {
 	})
 
 	t.Run("dollar price with 6 decimals", func(t *testing.T) {
-		reqs := types.PaymentRequirements{Amount: "2000", Asset: "0xUnknownToken"}
+		reqs := types.PaymentRequirements{Amount: "10000000", Asset: "0xUnknownToken"}
 		result, err := ResolveSettlementOverrideAmount("$0.05", reqs, 6)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
@@ -1277,6 +1386,50 @@ func TestResolveSettlementOverrideAmount(t *testing.T) {
 		if result != "50000" {
 			t.Errorf("expected 50000 (6 decimals), got %s", result)
 		}
+	})
+
+	t.Run("authorized maximum enforcement", func(t *testing.T) {
+		assertExceeds := func(t *testing.T, rawAmount string, reqs types.PaymentRequirements, decimals int) {
+			t.Helper()
+			_, err := ResolveSettlementOverrideAmount(rawAmount, reqs, decimals)
+			if err == nil || !strings.Contains(err.Error(), "exceeds the authorized maximum") {
+				t.Fatalf("ResolveSettlementOverrideAmount(%q, amount=%s) error = %v, want authorized maximum", rawAmount, reqs.Amount, err)
+			}
+		}
+
+		t.Run("raw atomic-unit override exceeds requirements amount", func(t *testing.T) {
+			assertExceeds(t, "2001", baseReqs, 6)
+		})
+
+		t.Run("percent override resolves above requirements amount", func(t *testing.T) {
+			assertExceeds(t, "500%", baseReqs, 6)
+			assertExceeds(t, "999999999999999999999%", types.PaymentRequirements{Amount: "1000000"}, 6)
+			assertExceeds(t, "92233720368547758.08%", types.PaymentRequirements{Amount: "1000000"}, 6)
+			assertExceeds(t, "184467440737095516.16%", types.PaymentRequirements{Amount: "1000000"}, 6)
+		})
+
+		t.Run("dollar override resolves above requirements amount", func(t *testing.T) {
+			reqs := types.PaymentRequirements{Amount: "999999"}
+			assertExceeds(t, "$1.00", reqs, 6)
+		})
+
+		t.Run("resolved amount equals requirements amount", func(t *testing.T) {
+			result, err := ResolveSettlementOverrideAmount("100%", baseReqs, 6)
+			if err != nil {
+				t.Fatalf("ResolveSettlementOverrideAmount(%q) error: %v", "100%", err)
+			}
+			if result != baseReqs.Amount {
+				t.Errorf("ResolveSettlementOverrideAmount(%q) = %q, want %q", "100%", result, baseReqs.Amount)
+			}
+
+			result, err = ResolveSettlementOverrideAmount(baseReqs.Amount, baseReqs, 6)
+			if err != nil {
+				t.Fatalf("ResolveSettlementOverrideAmount(%q) error: %v", baseReqs.Amount, err)
+			}
+			if result != baseReqs.Amount {
+				t.Errorf("ResolveSettlementOverrideAmount(%q) = %q, want %q", baseReqs.Amount, result, baseReqs.Amount)
+			}
+		})
 	})
 }
 
@@ -1312,6 +1465,51 @@ func TestValidateExtensions(t *testing.T) {
 		p := payloadWith(map[string]interface{}{"bazaar": map[string]interface{}{"info": map[string]interface{}{"tool": "wrong"}}})
 		if r := server.ValidateExtensions(nil, p); !r.Valid {
 			t.Fatalf("expected valid, got %+v", r)
+		}
+	})
+
+	t.Run("fails when undeclared builder-code carries app attribution", func(t *testing.T) {
+		p := payloadWith(map[string]interface{}{
+			"builder-code": map[string]interface{}{
+				"info": map[string]interface{}{"a": "attacker_app"},
+			},
+		})
+		r := server.ValidateExtensions(nil, p)
+		if r.Valid || r.InvalidReason != "extension_echo_mismatch" || r.ExtensionKey != "builder-code" {
+			t.Fatalf("expected echo mismatch on undeclared builder-code app attribution, got %+v", r)
+		}
+	})
+
+	t.Run("fails when another extension is declared but builder-code app attribution is not", func(t *testing.T) {
+		p := payloadWith(map[string]interface{}{
+			"builder-code": map[string]interface{}{
+				"info": map[string]interface{}{"a": "attacker_app"},
+			},
+		})
+		r := server.ValidateExtensions(serverExtensions, p)
+		if r.Valid || r.InvalidReason != "extension_echo_mismatch" || r.ExtensionKey != "builder-code" {
+			t.Fatalf("expected echo mismatch on undeclared builder-code app attribution, got %+v", r)
+		}
+	})
+
+	t.Run("passes when undeclared builder-code carries only client service attribution", func(t *testing.T) {
+		p := payloadWith(map[string]interface{}{
+			"builder-code": map[string]interface{}{
+				"info": map[string]interface{}{"s": []interface{}{"client_service"}},
+			},
+		})
+		if r := server.ValidateExtensions(nil, p); !r.Valid {
+			t.Fatalf("expected valid client-only service attribution, got %+v", r)
+		}
+	})
+
+	t.Run("fails when flat undeclared builder-code carries app attribution", func(t *testing.T) {
+		p := payloadWith(map[string]interface{}{
+			"builder-code": map[string]interface{}{"a": "attacker_app"},
+		})
+		r := server.ValidateExtensions(nil, p)
+		if r.Valid || r.InvalidReason != "extension_echo_mismatch" || r.ExtensionKey != "builder-code" {
+			t.Fatalf("expected echo mismatch on flat undeclared builder-code app attribution, got %+v", r)
 		}
 	})
 
@@ -1386,6 +1584,20 @@ func TestValidateExtensions(t *testing.T) {
 		}
 	})
 
+	t.Run("passes for v1 payloads with forged builder-code app attribution", func(t *testing.T) {
+		p := types.PaymentPayload{
+			X402Version: 1,
+			Extensions: map[string]interface{}{
+				"builder-code": map[string]interface{}{
+					"info": map[string]interface{}{"a": "forged_app"},
+				},
+			},
+		}
+		if r := server.ValidateExtensions(nil, p); !r.Valid {
+			t.Fatalf("expected v1 extensions to remain outside echo validation, got %+v", r)
+		}
+	})
+
 	// Extensions declared as typed Go structs (e.g. eip2612gassponsor.Extension)
 	// must validate the same way as map-declared extensions. Mirrors the gas
 	// extension shape inline to avoid an import cycle (eip2612gassponsor imports
@@ -1418,6 +1630,42 @@ func TestValidateExtensions(t *testing.T) {
 		})
 		if r := server.ValidateExtensions(structExtensions, p); !r.Valid {
 			t.Fatalf("expected valid, got %+v", r)
+		}
+	})
+
+	t.Run("passes with struct-declared builder-code and matching echo", func(t *testing.T) {
+		type builderInfo struct {
+			AppCode string `json:"a"`
+		}
+		type builderExtension struct {
+			Info builderInfo `json:"info"`
+		}
+		advertised := map[string]interface{}{
+			"builder-code": builderExtension{Info: builderInfo{AppCode: "honest_app"}},
+		}
+		p := payloadWith(map[string]interface{}{
+			"builder-code": map[string]interface{}{
+				"info": map[string]interface{}{"a": "honest_app"},
+			},
+		})
+		if r := server.ValidateExtensions(advertised, p); !r.Valid {
+			t.Fatalf("expected matching typed builder-code declaration to pass, got %+v", r)
+		}
+	})
+
+	t.Run("fails when typed undeclared builder-code carries app attribution", func(t *testing.T) {
+		type builderInfo struct {
+			AppCode string `json:"a"`
+		}
+		type builderExtension struct {
+			Info builderInfo `json:"info"`
+		}
+		p := payloadWith(map[string]interface{}{
+			"builder-code": builderExtension{Info: builderInfo{AppCode: "attacker_app"}},
+		})
+		r := server.ValidateExtensions(nil, p)
+		if r.Valid || r.InvalidReason != "extension_echo_mismatch" || r.ExtensionKey != "builder-code" {
+			t.Fatalf("expected echo mismatch on typed undeclared builder-code app attribution, got %+v", r)
 		}
 	})
 
@@ -1500,6 +1748,23 @@ func TestValidateExtensions(t *testing.T) {
 		})
 		if r := server.ValidateExtensions(advertised, p); !r.Valid {
 			t.Fatalf("expected valid additive s merge, got %+v", r)
+		}
+	})
+
+	t.Run("fails when builder-code app attribution differs from the declaration", func(t *testing.T) {
+		advertised := map[string]interface{}{
+			"builder-code": map[string]interface{}{
+				"info": map[string]interface{}{"a": "honest_app"},
+			},
+		}
+		p := payloadWith(map[string]interface{}{
+			"builder-code": map[string]interface{}{
+				"info": map[string]interface{}{"a": "attacker_app"},
+			},
+		})
+		r := server.ValidateExtensions(advertised, p)
+		if r.Valid || r.InvalidReason != "extension_echo_mismatch" || r.ExtensionKey != "builder-code" {
+			t.Fatalf("expected echo mismatch on builder-code app attribution, got %+v", r)
 		}
 	})
 
@@ -1640,4 +1905,33 @@ func TestValidateExtensions(t *testing.T) {
 			t.Fatalf("expected echo mismatch on sign-in-with-x, got %+v", r)
 		}
 	})
+}
+
+func TestVerifyPaymentWithExtensionsRejectsUndeclaredBuilderCodeAppAttribution(t *testing.T) {
+	server := Newx402ResourceServer()
+	payload := types.PaymentPayload{
+		X402Version: 2,
+		Extensions: map[string]interface{}{
+			"builder-code": map[string]interface{}{
+				"info": map[string]interface{}{"a": "attacker_app"},
+			},
+		},
+	}
+
+	result, err := server.VerifyPaymentWithExtensions(
+		context.Background(),
+		payload,
+		types.PaymentRequirements{},
+		nil,
+	)
+	if err == nil {
+		t.Fatal("expected undeclared builder-code app attribution to fail verification")
+	}
+	if result == nil || result.IsValid || result.InvalidReason != "extension_echo_mismatch" {
+		t.Fatalf("expected invalid extension echo result, got %+v", result)
+	}
+	var verifyErr *VerifyError
+	if !errors.As(err, &verifyErr) || verifyErr.InvalidReason != "extension_echo_mismatch" {
+		t.Fatalf("expected extension_echo_mismatch verify error, got %v", err)
+	}
 }

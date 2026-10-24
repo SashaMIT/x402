@@ -13,6 +13,7 @@ from typing import Any, TypeVar
 from typing_extensions import Self
 
 from .client_base import (
+    DEFAULT_MAX_AMOUNT_PER_PAYMENT,
     AfterPaymentCreationHook,
     BeforePaymentCreationHook,
     HookCommand,
@@ -20,6 +21,8 @@ from .client_base import (
     OnPaymentResponseHook,
     PaymentRequirementsSelector,
     SchemeRegistration,
+    SpendControlAsset,
+    SpendControls,
     SyncAfterPaymentCreationHook,
     SyncBeforePaymentCreationHook,
     SyncOnPaymentCreationFailureHook,
@@ -51,6 +54,9 @@ __all__ = [
     "x402ClientSync",
     "x402ClientConfig",
     "SchemeRegistration",
+    "SpendControlAsset",
+    "SpendControls",
+    "DEFAULT_MAX_AMOUNT_PER_PAYMENT",
     "default_payment_selector",
     "prefer_network",
     "prefer_scheme",
@@ -110,6 +116,8 @@ class x402Client(x402ClientBase):
                 client.register(scheme.network, scheme.client)  # type: ignore[arg-type]
         for policy in config.policies or []:
             client.register_policy(policy)
+        if config.spend_controls is not None:
+            client.set_spend_controls(config.spend_controls)
         return client
 
     # ========================================================================
@@ -222,14 +230,20 @@ class x402Client(x402ClientBase):
         self,
         gen: Generator[HookCommand, Any, PaymentPayloadT],
     ) -> PaymentPayloadT:
-        """Drive payment creation hooks, routing hook errors back through the generator."""
+        """Drive payment creation, routing hook and scheme errors back through the generator."""
         result = None
         try:
             command = gen.send(result)
             while True:
-                _, hook, ctx = command
+                phase, hook, ctx = command
                 try:
-                    result = await self._execute_hook(hook, ctx)
+                    if phase == "create":
+                        # Scheme clients are synchronous and may do network
+                        # I/O (RPC reads, blockhash lookups); run them off the
+                        # event loop so other tasks keep running.
+                        result = await asyncio.to_thread(hook, ctx)
+                    else:
+                        result = await self._execute_hook(hook, ctx)
                 except Exception as hook_error:
                     result = None
                     command = gen.throw(hook_error)
@@ -297,6 +311,8 @@ class x402ClientSync(x402ClientBase):
                 client.register(scheme.network, scheme.client)  # type: ignore[arg-type]
         for policy in config.policies or []:
             client.register_policy(policy)
+        if config.spend_controls is not None:
+            client.set_spend_controls(config.spend_controls)
         return client
 
     # ========================================================================
@@ -405,14 +421,17 @@ class x402ClientSync(x402ClientBase):
         self,
         gen: Generator[HookCommand, Any, PaymentPayloadT],
     ) -> PaymentPayloadT:
-        """Drive payment creation hooks, routing hook errors back through the generator."""
+        """Drive payment creation, routing hook and scheme errors back through the generator."""
         result = None
         try:
             command = gen.send(result)
             while True:
-                _, hook, ctx = command
+                phase, hook, ctx = command
                 try:
-                    result = self._execute_hook_sync(hook, ctx)
+                    if phase == "create":
+                        result = hook(ctx)
+                    else:
+                        result = self._execute_hook_sync(hook, ctx)
                 except Exception as hook_error:
                     result = None
                     command = gen.throw(hook_error)

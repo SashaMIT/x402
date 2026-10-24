@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach } from "vitest";
 import { ExactTvmScheme } from "../../../src/exact/server/scheme";
+import { convertToTokenAmount } from "@x402/core/utils";
 import {
   TVM_MAINNET,
   TVM_TESTNET,
@@ -21,6 +22,15 @@ describe("ExactTvmScheme (Server)", () => {
     it("should create instance", () => {
       expect(server).toBeDefined();
       expect(server.scheme).toBe("exact");
+    });
+  });
+
+  describe("paymentFlows", () => {
+    it("declares authorization and upfront with authorization as the default", () => {
+      expect(server.defaultAssetTransferMethod).toBe("default");
+      expect(server.paymentFlows).toEqual({
+        default: { supported: ["authorization", "upfront"], default: "authorization" },
+      });
     });
   });
 
@@ -112,8 +122,8 @@ describe("ExactTvmScheme (Server)", () => {
   describe("registerMoneyParser", () => {
     it("should use custom parser before default", async () => {
       server.registerMoneyParser(async (amount, _network) => {
-        if (amount > 100) {
-          return { amount: (amount * 1e9).toString(), asset: CUSTOM_ASSET };
+        if (Number(amount) > 100) {
+          return { amount: convertToTokenAmount(String(amount), 9), asset: CUSTOM_ASSET };
         }
         return null;
       });

@@ -15,7 +15,8 @@ import {
   buildSettleResponse,
 } from "../../mocks";
 import { Network } from "../../../src/types";
-import type { SettleResponse } from "../../../src/types/facilitator";
+import { FacilitatorCapabilityError, type SettleResponse } from "../../../src/types/facilitator";
+import { HTTPFacilitatorClient } from "../../../src/http/httpFacilitatorClient";
 
 describe("x402ResourceServer", () => {
   describe("Construction", () => {
@@ -61,10 +62,15 @@ describe("x402ResourceServer", () => {
     });
 
     it("should create default client if empty array provided", async () => {
-      const server = new x402ResourceServer([]);
+      const getSupportedSpy = vi
+        .spyOn(HTTPFacilitatorClient.prototype, "getSupported")
+        .mockResolvedValue(buildSupportedResponse());
 
-      // Should not throw - uses default client
+      const server = new x402ResourceServer([]);
       await expect(server.initialize()).resolves.not.toThrow();
+      expect(getSupportedSpy).toHaveBeenCalled();
+
+      getSupportedSpy.mockRestore();
     });
   });
 
@@ -351,6 +357,7 @@ describe("x402ResourceServer", () => {
       server.register("eip155:8453" as Network, new ValidatingScheme("exact", "needs a signer"));
 
       await expect(server.initialize()).rejects.toThrow(/exact on eip155:8453: needs a signer/);
+      await expect(server.initialize()).rejects.toBeInstanceOf(FacilitatorCapabilityError);
     });
 
     it("resolves when the hook returns void", async () => {
@@ -505,18 +512,18 @@ describe("x402ResourceServer", () => {
       expect(requirements[0].maxTimeoutSeconds).toBe(600);
     });
 
-    it("should return empty array if no scheme registered for network", async () => {
+    it("should throw if no scheme registered for network", async () => {
       const server = new x402ResourceServer();
 
-      const requirements = await server.buildPaymentRequirements({
-        scheme: "test-scheme",
-        payTo: "recipient",
-        price: 1.0,
-        network: "test:network" as Network,
-      });
-
-      // Current implementation returns empty array and logs warning
-      expect(requirements).toEqual([]);
+      await expect(
+        async () =>
+          await server.buildPaymentRequirements({
+            scheme: "test-scheme",
+            payTo: "recipient",
+            price: 1.0,
+            network: "test:network" as Network,
+          }),
+      ).rejects.toThrow("No server implementation registered for test-scheme on test:network");
     });
 
     it("should throw if facilitator doesn't support scheme/network", async () => {
@@ -1725,7 +1732,7 @@ describe("x402ResourceServer", () => {
       const requirements = buildPaymentRequirements({
         scheme: "exact",
         network: "eip155:8453" as Network,
-        amount: "1000000",
+        amount: "10000000",
       });
 
       await server.settlePayment(payload, requirements, undefined, undefined, { amount: "$0.05" });
@@ -1996,6 +2003,70 @@ describe("x402ResourceServer", () => {
       expect(server.validateExtensions(paymentRequired, payload)).toEqual({ valid: true });
     });
 
+    it("fails when client forges builder-code app code without server declaration", () => {
+      const server = new x402ResourceServer();
+      const paymentRequired = buildPaymentRequired({ extensions: undefined });
+      const payload = buildPaymentPayload({
+        extensions: {
+          "builder-code": { info: { a: "forged_app" } },
+        },
+      });
+
+      expect(server.validateExtensions(paymentRequired, payload)).toEqual({
+        valid: false,
+        invalidReason: "extension_echo_mismatch",
+        extensionKey: "builder-code",
+      });
+    });
+
+    it("fails when client forges builder-code app code while server declares other extensions", () => {
+      const server = new x402ResourceServer();
+      const paymentRequired = buildPaymentRequired({ extensions: serverExtensions });
+      const payload = buildPaymentPayload({
+        extensions: {
+          "builder-code": { info: { a: "forged_app" } },
+        },
+      });
+
+      expect(server.validateExtensions(paymentRequired, payload)).toEqual({
+        valid: false,
+        invalidReason: "extension_echo_mismatch",
+        extensionKey: "builder-code",
+      });
+    });
+
+    it("passes when client sends only builder-code service codes without server declaration", () => {
+      const server = new x402ResourceServer();
+      const paymentRequired = buildPaymentRequired({ extensions: undefined });
+      const payload = buildPaymentPayload({
+        extensions: {
+          "builder-code": { info: { s: ["bc_client"] } },
+        },
+      });
+
+      expect(server.validateExtensions(paymentRequired, payload)).toEqual({ valid: true });
+    });
+
+    it("fails when client forges builder-code app code that mismatches server declaration", () => {
+      const server = new x402ResourceServer();
+      const paymentRequired = buildPaymentRequired({
+        extensions: {
+          "builder-code": { info: { a: "bc_app" } },
+        },
+      });
+      const payload = buildPaymentPayload({
+        extensions: {
+          "builder-code": { info: { a: "forged_app" } },
+        },
+      });
+
+      expect(server.validateExtensions(paymentRequired, payload)).toEqual({
+        valid: false,
+        invalidReason: "extension_echo_mismatch",
+        extensionKey: "builder-code",
+      });
+    });
+
     it("passes when client omits extensions", () => {
       const server = new x402ResourceServer();
       const paymentRequired = buildPaymentRequired({ extensions: serverExtensions });
@@ -2090,6 +2161,19 @@ describe("x402ResourceServer", () => {
       const payload = buildPaymentPayload({
         x402Version: 1,
         extensions: { bazaar: { info: { tool: "wrong" } } },
+      });
+
+      expect(server.validateExtensions(paymentRequired, payload)).toEqual({ valid: true });
+    });
+
+    it("passes for v1 payloads with forged builder-code app code", () => {
+      const server = new x402ResourceServer();
+      const paymentRequired = buildPaymentRequired({ extensions: undefined });
+      const payload = buildPaymentPayload({
+        x402Version: 1,
+        extensions: {
+          "builder-code": { info: { a: "forged_app" } },
+        },
       });
 
       expect(server.validateExtensions(paymentRequired, payload)).toEqual({ valid: true });
@@ -2682,6 +2766,38 @@ describe("x402ResourceServer", () => {
       );
 
       expect(result.extensions).toEqual({ bazaar: true, customExt: "value" });
+    });
+
+    it("should not mutate the extensions it was given while enriching", async () => {
+      // The same object travels on to settle() as declaredExtensions, so
+      // enrichment writing through it strips the declaration a later hook
+      // (enrichSettlementResponse) needs.
+      const server = new x402ResourceServer();
+      server.registerExtension({
+        key: "receiptish",
+        // Returns something shaped nothing like its own declaration, which is
+        // the normal case: an extension returns signed offers, not its config.
+        enrichPaymentRequiredResponse: async () => ({ info: { offers: ["signed"] } }),
+      });
+
+      const declaration = { includeTxHash: true };
+      const extensions = { receiptish: declaration };
+
+      const result = await server.createPaymentRequiredResponse(
+        [buildPaymentRequirements()],
+        { url: "https://example.com", description: "", mimeType: "" },
+        undefined,
+        extensions,
+      );
+
+      // The 402 carries the enriched value.
+      expect((result.extensions?.receiptish as { info?: unknown })?.info).toEqual({
+        offers: ["signed"],
+      });
+
+      // The caller's object is untouched.
+      expect(extensions.receiptish).toBe(declaration);
+      expect(declaration).toEqual({ includeTxHash: true });
     });
 
     it("should omit extensions if empty", async () => {
@@ -3277,30 +3393,70 @@ describe("resolveSettlementOverrideAmount", () => {
   });
 
   describe("dollar price format", () => {
+    // Dollar amounts resolve independently of requirements.amount, so this
+    // block uses its own, larger fixture to stay under the authorized-maximum
+    // check below regardless of decimals (unlike raw/percent, whose values
+    // are inherently derived from — or smaller than — baseRequirements.amount).
+    const dollarRequirements = buildPaymentRequirements({ amount: "10000000" });
+
     it("converts '$1.00' using provided 6 decimals", () => {
-      expect(resolveSettlementOverrideAmount("$1.00", baseRequirements, 6)).toBe("1000000");
+      expect(resolveSettlementOverrideAmount("$1.00", dollarRequirements, 6)).toBe("1000000");
     });
 
     it("converts '$0.05' using provided 6 decimals", () => {
-      expect(resolveSettlementOverrideAmount("$0.05", baseRequirements, 6)).toBe("50000");
+      expect(resolveSettlementOverrideAmount("$0.05", dollarRequirements, 6)).toBe("50000");
     });
 
     it("converts '$0.05' using 8 decimals when provided", () => {
-      expect(resolveSettlementOverrideAmount("$0.05", baseRequirements, 8)).toBe("5000000");
+      expect(resolveSettlementOverrideAmount("$0.05", dollarRequirements, 8)).toBe("5000000");
     });
 
     it("converts '$0.001' using provided 6 decimals", () => {
-      expect(resolveSettlementOverrideAmount("$0.001", baseRequirements, 6)).toBe("1000");
+      expect(resolveSettlementOverrideAmount("$0.001", dollarRequirements, 6)).toBe("1000");
     });
 
     it("converts '$0' to '0'", () => {
-      expect(resolveSettlementOverrideAmount("$0", baseRequirements, 6)).toBe("0");
+      expect(resolveSettlementOverrideAmount("$0", dollarRequirements, 6)).toBe("0");
+    });
+
+    it("pads and truncates toward zero without rounding", () => {
+      expect(resolveSettlementOverrideAmount("$1.0000005", dollarRequirements, 6)).toBe("1000000");
+      expect(resolveSettlementOverrideAmount("$0.0000005", dollarRequirements, 6)).toBe("0");
+      expect(resolveSettlementOverrideAmount("$0.0000009", dollarRequirements, 6)).toBe("0");
     });
 
     it("throws when decimals are unknown", () => {
-      expect(() => resolveSettlementOverrideAmount("$1.00", baseRequirements)).toThrow(
+      expect(() => resolveSettlementOverrideAmount("$1.00", dollarRequirements)).toThrow(
         /asset decimals are unknown/,
       );
+    });
+  });
+
+  describe("authorized maximum enforcement", () => {
+    it("throws when a raw atomic-unit override exceeds requirements.amount", () => {
+      expect(() => resolveSettlementOverrideAmount("2001", baseRequirements)).toThrow(
+        /exceeds the authorized maximum/,
+      );
+    });
+
+    it("throws when a percent override resolves above 100% of requirements.amount", () => {
+      expect(() => resolveSettlementOverrideAmount("500%", baseRequirements)).toThrow(
+        /exceeds the authorized maximum/,
+      );
+    });
+
+    it("throws when a dollar override resolves above requirements.amount", () => {
+      const reqs = buildPaymentRequirements({ amount: "999999" });
+      expect(() => resolveSettlementOverrideAmount("$1.00", reqs, 6)).toThrow(
+        /exceeds the authorized maximum/,
+      );
+    });
+
+    it("does not throw when the resolved amount equals requirements.amount exactly", () => {
+      expect(() => resolveSettlementOverrideAmount("100%", baseRequirements)).not.toThrow();
+      expect(() =>
+        resolveSettlementOverrideAmount(baseRequirements.amount, baseRequirements),
+      ).not.toThrow();
     });
   });
 });

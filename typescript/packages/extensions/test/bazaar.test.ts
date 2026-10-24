@@ -1408,6 +1408,38 @@ describe("Bazaar Discovery Extension", () => {
       expect(postResult.valid).toBe(true);
     });
 
+    // Issue #3511: a route registered without a verb returns 402 for any method,
+    // so the probe method can disagree with the declared input shape.
+    it.each([
+      {
+        name: "body declaration probed with GET",
+        config: { input: { prompt: "hi" }, bodyType: "json" as const },
+        probe: "GET",
+        expected: "POST",
+      },
+      {
+        name: "query declaration probed with POST",
+        config: { input: { q: "hi" } },
+        probe: "POST",
+        expected: "GET",
+      },
+    ])("should not advertise the probe method for a $name", ({ config, probe, expected }) => {
+      const declared = declareDiscoveryExtension(config);
+
+      const enriched = bazaarResourceServerExtension.enrichDeclaration!(declared.bazaar, {
+        method: probe,
+        path: "/test",
+        adapter: createMockAdapter(),
+      }) as DiscoveryExtension;
+
+      expect((enriched.info as BodyDiscoveryInfo).input.method).toBe(expected);
+      expect(extractMethodEnum(enriched.schema as Record<string, unknown>)).toEqual([expected]);
+      expect(
+        validateDiscoveryExtensionSpec(enriched as unknown as Record<string, unknown>),
+      ).toEqual({ valid: true });
+      expect(validateDiscoveryExtension(enriched)).toEqual({ valid: true });
+    });
+
     it("should return unchanged declaration for non-HTTP context", () => {
       const declared = declareDiscoveryExtension({
         input: { data: "test" },
@@ -1972,6 +2004,28 @@ describe("Bazaar Discovery Extension", () => {
       expect(input.pathParams).toEqual({ var1: "san-francisco" });
     });
 
+    it("should not emit routeTemplate for a bare wildcard * pattern", () => {
+      const declared = declareDiscoveryExtension({
+        input: {},
+        inputSchema: { properties: {} },
+      });
+      const extension = declared.bazaar;
+
+      const httpContext: HTTPRequestContext = {
+        method: "GET",
+        path: "/api/rotation",
+        routePattern: "*",
+        adapter: createMockAdapterWithPath("/api/rotation"),
+      };
+
+      const enriched = bazaarResourceServerExtension.enrichDeclaration!(
+        extension,
+        httpContext,
+      ) as Record<string, unknown>;
+
+      expect(enriched.routeTemplate).toBeUndefined();
+    });
+
     it("should auto-convert multiple wildcards to :var1, :var2, etc.", () => {
       const declared = declareDiscoveryExtension({
         input: {},
@@ -2116,6 +2170,42 @@ describe("Bazaar Discovery Extension", () => {
     it("rejects percent-encoded traversal sequences", () => {
       expect(isValidRouteTemplate("/users/%2e%2e/admin")).toBe(false);
       expect(isValidRouteTemplate("/users/%2E%2E/admin")).toBe(false);
+    });
+
+    it("rejects double-encoded traversal sequences (regression for double-decode bypass)", () => {
+      // %25 decodes to "%", so %252e%252e decodes-once to "%2e%2e" (still
+      // encoded) and only decodes-twice to "..". A single-pass decode
+      // wouldn't see the traversal here.
+      expect(isValidRouteTemplate("/users/%252e%252e/admin")).toBe(false);
+      expect(isValidRouteTemplate("/users/%252E%252E/admin")).toBe(false);
+    });
+
+    it("rejects triple-encoded traversal sequences", () => {
+      expect(isValidRouteTemplate("/users/%25252e%25252e/admin")).toBe(false);
+    });
+
+    it("rejects double-encoded scheme injection", () => {
+      // %3a decodes to ":", %2f decodes to "/" — %253a%252f%252f decodes-once
+      // to "%3a%2f%2f" (still encoded) and decodes-twice to "://".
+      expect(isValidRouteTemplate("/users/javascript%253a%252f%252fevil")).toBe(false);
+    });
+
+    it("still accepts a legitimate single percent-encoded segment", () => {
+      // One decode pass resolves this to plain text with no further
+      // encoding, reaching a fixed point immediately — must not be rejected
+      // just for containing a "%".
+      expect(isValidRouteTemplate("/search/caf%C3%A9")).toBe(true);
+    });
+
+    it("rejects a value whose percent-encoding never resolves to a fixed point", () => {
+      // Pathologically deep encoding (more than the decode-pass budget) has
+      // no safe canonical form to validate — reject rather than decode
+      // indefinitely. ":" is re-encoded ("%3A" → "%253A" → ...) on every
+      // encodeURIComponent pass, so this compounds correctly (unlike "..",
+      // whose dots encodeURIComponent leaves untouched).
+      let value: string = ":";
+      for (let i = 0; i < 8; i++) value = encodeURIComponent(value);
+      expect(isValidRouteTemplate(`/users/x${value}/admin`)).toBe(false);
     });
   });
 
@@ -2554,6 +2644,71 @@ describe("Bazaar Discovery Extension", () => {
       spy.mockRestore();
     });
 
+    it("should keep protocol checks when runtime code generation is unavailable", () => {
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      const ext = declareDiscoveryExtension({
+        input: { q: "test" },
+        inputSchema: { properties: { q: { type: "string" } } },
+      });
+      const accepts = [
+        { scheme: "exact", payTo: "0x1", price: "$0.01", network: "eip155:1" as const },
+      ];
+      const routes = {
+        "/valid": {
+          accepts,
+          extensions: ext,
+        },
+        "/invalid": {
+          accepts,
+          extensions: {
+            bazaar: {
+              info: { input: { type: "grpc" } },
+              schema: {},
+            },
+          },
+        },
+      };
+
+      try {
+        vi.stubGlobal("Function", function () {
+          throw new EvalError("Code generation from strings disallowed for this context");
+        });
+        validateBazaarRouteExtensions(routes);
+        expect(warnSpy).toHaveBeenCalledTimes(1);
+        expect(warnSpy.mock.calls[0][0]).toContain('Route "/invalid"');
+        expect(warnSpy.mock.calls[0][0]).toContain("input.type");
+        expect(errorSpy).not.toHaveBeenCalled();
+      } finally {
+        vi.unstubAllGlobals();
+        warnSpy.mockRestore();
+        errorSpy.mockRestore();
+      }
+    });
+
+    it("should warn when a bazaar extension has a malformed JSON schema in Node", () => {
+      const spy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const routes = {
+        "/api": {
+          accepts: [
+            { scheme: "exact", payTo: "0x1", price: "$0.01", network: "eip155:1" as const },
+          ],
+          extensions: {
+            bazaar: {
+              info: { input: { type: "http", method: "GET" } },
+              schema: { type: "not-a-json-schema-type" },
+            },
+          },
+        },
+      };
+
+      validateBazaarRouteExtensions(routes);
+
+      expect(spy).toHaveBeenCalledTimes(1);
+      expect(spy.mock.calls[0][0]).toContain("invalid bazaar extension");
+      spy.mockRestore();
+    });
+
     it("should warn for an extension with invalid input.type", () => {
       const spy = vi.spyOn(console, "warn").mockImplementation(() => {});
       const routes = {
@@ -2572,6 +2727,24 @@ describe("Bazaar Discovery Extension", () => {
       validateBazaarRouteExtensions(routes);
       expect(spy).toHaveBeenCalledTimes(1);
       expect(spy.mock.calls[0][0]).toContain("invalid bazaar extension");
+      spy.mockRestore();
+    });
+
+    it("should warn for a malformed bazaar extension object", () => {
+      const spy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const routes = {
+        "/api": {
+          accepts: [
+            { scheme: "exact", payTo: "0x1", price: "$0.01", network: "eip155:1" as const },
+          ],
+          extensions: {
+            bazaar: { info: { input: { method: "GET" } } },
+          },
+        },
+      };
+      validateBazaarRouteExtensions(routes);
+      expect(spy).toHaveBeenCalledTimes(1);
+      expect(spy.mock.calls[0][0]).toContain("malformed");
       spy.mockRestore();
     });
   });
